@@ -69,7 +69,7 @@ for FLAVOUR in "${FLAVOURS[@]}"; do
             printf "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=$CUSTOM_USER\n" > rootdir/etc/gdm3/daemon.conf
             chroot rootdir systemctl enable gdm3
         elif [ "$FLAVOUR" = "kde" ]; then
-            chroot rootdir bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get install -y kde-standard sddm akregator- dragonplayer- gwenview- juk- kaddressbook- kcalc- kmail- konq-plugins- korganizer- okular-  keditbookmarks-  konqueror- kwrite-"
+            chroot rootdir bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get install -y kde-standard sddm"
             mkdir -p rootdir/etc/sddm.conf.d
             printf "[Autologin]\nUser=$CUSTOM_USER\nSession=plasma\n" > rootdir/etc/sddm.conf.d/autologin.conf
             chroot rootdir systemctl enable sddm
