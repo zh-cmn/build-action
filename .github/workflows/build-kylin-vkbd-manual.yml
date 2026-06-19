@@ -183,10 +183,45 @@ jobs:
           from pathlib import Path
           import re
 
+          def remove_cpp_function(text: str, signature_regex: str) -> str:
+              """
+              Remove one C++ function definition by locating the signature and matching braces.
+              This is intentionally simple but robust enough for ordinary out-of-class definitions.
+              """
+              m = re.search(signature_regex, text)
+              if not m:
+                  return text
+
+              start = m.start()
+              brace = text.find("{", m.end())
+              if brace == -1:
+                  return text
+
+              depth = 0
+              end = None
+              for i in range(brace, len(text)):
+                  if text[i] == "{":
+                      depth += 1
+                  elif text[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          break
+
+              if end is None:
+                  raise RuntimeError("Could not find function body end")
+
+              while end < len(text) and text[end] in " \t\r\n":
+                  end += 1
+
+              return text[:start] + text[end:]
+
           # Patch 1:
           # Fix X11Kf6WorkspaceAdjuster declarations.
-          # The original Qt6 header may mark the constructor override, which is invalid.
-          # Do not inline method bodies here because x11workspaceadjuster.cpp already defines them.
+          # Constructor is made inline default in header.
+          # This avoids both:
+          # - invalid constructor override
+          # - linker undefined reference to X11Kf6WorkspaceAdjuster::X11Kf6WorkspaceAdjuster()
           h = Path("src/src/workspaceadjuster/x11workspaceadjuster.h")
           if h.exists():
               text = h.read_text()
@@ -202,17 +237,23 @@ jobs:
 
                   body = re.sub(
                       r"X11Kf6WorkspaceAdjuster\(\)\s*(?:override\s*)?=\s*default\s*;",
-                      "X11Kf6WorkspaceAdjuster();",
+                      "X11Kf6WorkspaceAdjuster() = default;",
                       body,
                   )
 
                   body = re.sub(
                       r"X11Kf6WorkspaceAdjuster\(\)\s*override\s*;",
-                      "X11Kf6WorkspaceAdjuster();",
+                      "X11Kf6WorkspaceAdjuster() = default;",
                       body,
                   )
 
-                  # If an older bad patch inserted an inline function body, collapse it back.
+                  body = re.sub(
+                      r"X11Kf6WorkspaceAdjuster\(\)\s*;",
+                      "X11Kf6WorkspaceAdjuster() = default;",
+                      body,
+                  )
+
+                  # If an older bad patch inserted an inline raiseInputArea body, collapse it back.
                   body = re.sub(
                       r"void\s+raiseInputArea\s*\(\s*QWindow\s*\*\s*\w+\s*,\s*const\s+QRect\s*&\s*\w+\s*\)\s*override\s*\{.*?\n\s*\}",
                       "void raiseInputArea(QWindow *window, const QRect &rect) override;",
@@ -238,11 +279,23 @@ jobs:
               print(f"Skip: {h} not found")
 
           # Patch 2:
-          # In Qt6/KF6 build, do not compile the old X11Kf5WorkspaceAdjuster implementation.
-          # That block refers to KWindowSystem in the KF5 path and breaks Qt6 builds.
+          # In Qt6/KF6 build, do not compile old X11Kf5WorkspaceAdjuster implementation.
+          # It refers to old KWindowSystem usage and breaks Qt6 builds.
+          #
+          # Also remove any out-of-class X11Kf6 constructor definition, because the constructor
+          # is now inline-defaulted in the header.
           cpp = Path("src/src/workspaceadjuster/x11workspaceadjuster.cpp")
           if cpp.exists():
               text = cpp.read_text()
+
+              # Remove Kf6 constructor definition if present.
+              text2 = remove_cpp_function(
+                  text,
+                  r"X11Kf6WorkspaceAdjuster::X11Kf6WorkspaceAdjuster\s*\(\s*\)\s*"
+              )
+              if text2 != text:
+                  text = text2
+                  print("Removed out-of-class X11Kf6WorkspaceAdjuster constructor definition")
 
               qt5_guard = "#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)"
               start = text.find("X11Kf5WorkspaceAdjuster::")
@@ -259,12 +312,13 @@ jobs:
                           + "#endif\n\n"
                           + text[end:]
                       )
-                      cpp.write_text(text)
                       print(f"Guarded Qt5-only X11Kf5WorkspaceAdjuster block in {cpp}")
                   else:
                       print(f"Skip: Qt5 guard already present in {cpp}")
               else:
                   print(f"Skip: could not locate Kf5/Kf6 implementation boundary in {cpp}")
+
+              cpp.write_text(text)
           else:
               print(f"Skip: {cpp} not found")
 
