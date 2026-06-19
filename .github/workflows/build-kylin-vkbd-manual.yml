@@ -1,0 +1,362 @@
+name: Build Kylin Virtual Keyboard manual archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_archive_path:
+        description: "Source archive path from repository root, for example vendor/kylin-virtual-keyboard/support_qt6.zip"
+        required: true
+        default: "vendor/kylin-virtual-keyboard/support_qt6.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build arm64 deb
+    runs-on: ubuntu-24.04-arm
+
+    container:
+      image: debian:forky
+      options: --user root
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      SOURCE_ARCHIVE_PATH: ${{ inputs.source_archive_path }}
+      DEBIAN_SUITE: forky
+      QT_MAJOR: "6"
+
+    steps:
+      - name: Install base tools
+        run: |
+          set -eux
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git \
+            unzip \
+            xz-utils \
+            zstd \
+            file \
+            findutils \
+            coreutils \
+            sed \
+            grep
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Resolve archive metadata
+        id: archive
+        run: |
+          set -eux
+
+          ARCHIVE="$SOURCE_ARCHIVE_PATH"
+
+          case "$ARCHIVE" in
+            /*|*../*|../*)
+              echo "source_archive_path must be a relative path inside this repository." >&2
+              exit 1
+              ;;
+          esac
+
+          if [ ! -f "$ARCHIVE" ]; then
+            echo "Source archive not found: $ARCHIVE" >&2
+            echo "Existing archive-like files:" >&2
+            find . -type f \( \
+              -name '*.zip' -o \
+              -name '*.tar.gz' -o \
+              -name '*.tgz' -o \
+              -name '*.tar.xz' -o \
+              -name '*.txz' -o \
+              -name '*.tar.zst' \
+            \) -print | sed 's#^\./##' || true
+            exit 1
+          fi
+
+          FILENAME="$(basename "$ARCHIVE")"
+          BASE="$FILENAME"
+
+          case "$BASE" in
+            *.tar.gz) BASE="${BASE%.tar.gz}" ;;
+            *.tgz)    BASE="${BASE%.tgz}" ;;
+            *.tar.xz) BASE="${BASE%.tar.xz}" ;;
+            *.txz)    BASE="${BASE%.txz}" ;;
+            *.tar.zst) BASE="${BASE%.tar.zst}" ;;
+            *.zip)    BASE="${BASE%.zip}" ;;
+            *)
+              echo "Unsupported archive format: $FILENAME" >&2
+              echo "Supported: .zip .tar.gz .tgz .tar.xz .txz .tar.zst" >&2
+              exit 1
+              ;;
+          esac
+
+          SAFE_BASE="$(printf '%s' "$BASE" | sed -E 's/[^A-Za-z0-9._-]+/-/g')"
+
+          VERSION="$(
+            printf '%s\n' "$FILENAME" \
+              | grep -oE '[0-9]+(\.[0-9]+)+' \
+              | head -n 1 || true
+          )"
+
+          if [ -z "$VERSION" ]; then
+            VERSION="0.0~manual$(date -u +%Y%m%d%H%M%S)"
+          fi
+
+          DEB_VERSION="${VERSION}-1~${DEBIAN_SUITE}1"
+          ARTIFACT_NAME="${SAFE_BASE}-debian-${DEBIAN_SUITE}-arm64-qt${QT_MAJOR}"
+
+          file "$ARCHIVE"
+
+          echo "archive_path=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "base=$SAFE_BASE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$DEB_VERSION" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "ARCHIVE=$ARCHIVE"
+          echo "FILENAME=$FILENAME"
+          echo "BASE=$SAFE_BASE"
+          echo "VERSION=$VERSION"
+          echo "DEB_VERSION=$DEB_VERSION"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME"
+
+      - name: Extract source archive
+        run: |
+          set -eux
+
+          ARCHIVE="${{ steps.archive.outputs.archive_path }}"
+
+          rm -rf work src
+          mkdir -p work/extract src
+
+          case "$ARCHIVE" in
+            *.zip)
+              unzip -q "$ARCHIVE" -d work/extract
+              ;;
+            *.tar.gz|*.tgz)
+              tar -xzf "$ARCHIVE" -C work/extract
+              ;;
+            *.tar.xz|*.txz)
+              tar -xJf "$ARCHIVE" -C work/extract
+              ;;
+            *.tar.zst)
+              tar --zstd -xf "$ARCHIVE" -C work/extract
+              ;;
+            *)
+              echo "Unsupported archive format: $ARCHIVE" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Top-level extracted files:"
+          find work/extract -maxdepth 2 -mindepth 1 -print | head -100
+
+          TOP_COUNT="$(find work/extract -mindepth 1 -maxdepth 1 | wc -l)"
+          TOP_FIRST="$(find work/extract -mindepth 1 -maxdepth 1 | head -n 1)"
+
+          if [ "$TOP_COUNT" = "1" ] && [ -d "$TOP_FIRST" ]; then
+            cp -a "$TOP_FIRST"/. src/
+          else
+            cp -a work/extract/. src/
+          fi
+
+          if [ ! -f src/CMakeLists.txt ]; then
+            echo "CMakeLists.txt not found after extraction." >&2
+            echo "The archive should contain the project root directly, or one top-level folder containing CMakeLists.txt." >&2
+            find src -maxdepth 2 -print | head -100 >&2
+            exit 1
+          fi
+
+          echo "Source root:"
+          ls -la src
+
+      - name: Install Debian packaging tools
+        run: |
+          set -eux
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            dpkg-dev \
+            debhelper \
+            devscripts \
+            equivs \
+            fakeroot \
+            cmake \
+            pkgconf \
+            lintian
+
+      - name: Create minimal Debian packaging
+        working-directory: src
+        run: |
+          set -eux
+
+          VERSION="${{ steps.archive.outputs.version }}"
+          DEB_VERSION="${{ steps.archive.outputs.deb_version }}"
+          SOURCE_FILE="${{ steps.archive.outputs.filename }}"
+
+          rm -rf debian
+          mkdir -p debian/source
+
+          cat > debian/source/format <<'EOF'
+          3.0 (quilt)
+          EOF
+
+          cat > debian/changelog <<EOF
+          kylin-virtual-keyboard (${DEB_VERSION}) ${DEBIAN_SUITE}; urgency=medium
+
+            * CI rebuild from manually uploaded source archive.
+            * Source archive: ${SOURCE_FILE}.
+            * Qt6 build for Debian forky arm64.
+
+           -- GitHub Actions <actions@github.com>  $(date -R)
+          EOF
+
+          cat > debian/copyright <<'EOF'
+          Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+          Upstream-Name: kylin-virtual-keyboard
+          Source: https://gitee.com/openkylin/kylin-virtual-keyboard
+
+          Files: *
+          Copyright: openKylin community contributors
+          License: LGPL-3.0
+          EOF
+
+          cat > debian/postinst <<'EOF'
+          #!/bin/sh
+          set -e
+
+          if command -v glib-compile-schemas >/dev/null 2>&1; then
+              glib-compile-schemas /usr/share/glib-2.0/schemas || true
+          fi
+
+          #DEBHELPER#
+          EOF
+
+          cat > debian/postrm <<'EOF'
+          #!/bin/sh
+          set -e
+
+          if command -v glib-compile-schemas >/dev/null 2>&1; then
+              glib-compile-schemas /usr/share/glib-2.0/schemas || true
+          fi
+
+          #DEBHELPER#
+          EOF
+
+          chmod +x debian/postinst debian/postrm
+
+          cat > debian/control <<'EOF'
+          Source: kylin-virtual-keyboard
+          Section: utils
+          Priority: optional
+          Maintainer: Local CI <ci@example.invalid>
+          Rules-Requires-Root: no
+          Build-Depends:
+           debhelper-compat (= 13),
+           cmake,
+           pkgconf,
+           extra-cmake-modules,
+           gettext,
+           libspdlog-dev,
+           libfcitx5core-dev,
+           libkf6windowsystem-dev,
+           qt6-base-dev,
+           qt6-declarative-dev,
+           qt6-5compat-dev,
+           qt6-tools-dev-tools,
+           libgsettings-qt6-dev,
+           libglib2.0-dev,
+           qml6-module-qtquick,
+           qml6-module-qtquick-controls,
+           qml6-module-qtquick-layouts
+          Standards-Version: 4.7.2
+          Homepage: https://gitee.com/openkylin/kylin-virtual-keyboard
+
+          Package: kylin-virtual-keyboard
+          Architecture: any
+          Depends:
+           ${shlibs:Depends},
+           ${misc:Depends},
+           fcitx5,
+           qml6-module-qtquick,
+           qml6-module-qtquick-controls,
+           qml6-module-qtquick-layouts
+          Description: Kylin virtual keyboard
+           Virtual keyboard based on the Fcitx5 input method framework.
+          EOF
+
+          cat > debian/rules <<'EOF'
+          #!/usr/bin/make -f
+          .RECIPEPREFIX := >
+
+          export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+          %:
+          >dh $@
+
+          override_dh_auto_configure:
+          >dh_auto_configure -- -DCMAKE_INSTALL_PREFIX=/usr -DENABLE_QT6=ON -DENABLE_TEST=OFF
+
+          override_dh_auto_install:
+          >dh_auto_install --destdir=debian/kylin-virtual-keyboard
+          EOF
+
+          chmod +x debian/rules
+
+          echo "Generated debian/control:"
+          cat debian/control
+
+          echo "Generated debian/rules:"
+          cat debian/rules
+
+      - name: Install build dependencies
+        working-directory: src
+        run: |
+          set -eux
+
+          mk-build-deps \
+            --install \
+            --remove \
+            --tool "apt-get -y --no-install-recommends" \
+            debian/control
+
+      - name: Build Debian package
+        working-directory: src
+        run: |
+          set -eux
+
+          dpkg-buildpackage -b -us -uc
+
+      - name: Collect artifacts
+        run: |
+          set -eux
+
+          mkdir -p out
+
+          find . -maxdepth 1 -type f -name 'kylin-virtual-keyboard_*.deb' -exec cp -v {} out/ \;
+          find . -maxdepth 1 -type f -name 'kylin-virtual-keyboard_*.buildinfo' -exec cp -v {} out/ \;
+          find . -maxdepth 1 -type f -name 'kylin-virtual-keyboard_*.changes' -exec cp -v {} out/ \;
+
+          cat > out/README.txt <<EOF
+          Source archive: ${{ steps.archive.outputs.filename }}
+          Package version: ${{ steps.archive.outputs.deb_version }}
+          Target: Debian forky arm64 Qt6
+          Install command:
+            sudo apt install ./kylin-virtual-keyboard_*_arm64.deb
+          EOF
+
+          echo "Artifacts:"
+          ls -lh out
+
+          test "$(find out -type f -name '*.deb' | wc -l)" -gt 0
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.artifact_name }}
+          path: out/*
+          if-no-files-found: error
