@@ -181,39 +181,94 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           # Patch 1:
-          # Fix X11Kf6WorkspaceAdjuster:
-          # - constructor cannot be marked override
-          # - class must implement WorkspaceAdjuster::raiseInputArea(QWindow*, const QRect&)
-          p = Path("src/src/workspaceadjuster/x11workspaceadjuster.h")
-          if p.exists():
-              text = p.read_text()
+          # Fix X11Kf6WorkspaceAdjuster declarations.
+          # The original Qt6 header may mark the constructor override, which is invalid.
+          # Do not inline method bodies here because x11workspaceadjuster.cpp already defines them.
+          h = Path("src/src/workspaceadjuster/x11workspaceadjuster.h")
+          if h.exists():
+              text = h.read_text()
 
-              text = text.replace(
-                  "X11Kf6WorkspaceAdjuster() override = default;",
-                  "X11Kf6WorkspaceAdjuster() = default;"
+              m = re.search(
+                  r"(class\s+X11Kf6WorkspaceAdjuster\s*:\s*public\s+WorkspaceAdjuster\s*\{)(.*?)(\n\};)",
+                  text,
+                  flags=re.S,
               )
 
-              if (
-                  "void raiseInputArea(QWindow *window, const QRect &rect) override" not in text
-                  and "void raiseInputArea(const QRect &rect);" in text
-              ):
-                  text = text.replace(
-                      "void raiseInputArea(const QRect &rect);",
-                      """void raiseInputArea(QWindow *window, const QRect &rect) override {
-                  (void)window;
-                  raiseInputArea(rect);
-              }
-              void raiseInputArea(const QRect &rect);"""
+              if m:
+                  prefix, body, suffix = m.groups()
+
+                  body = re.sub(
+                      r"X11Kf6WorkspaceAdjuster\(\)\s*(?:override\s*)?=\s*default\s*;",
+                      "X11Kf6WorkspaceAdjuster();",
+                      body,
                   )
 
-              p.write_text(text)
-              print(f"Patched {p}")
+                  body = re.sub(
+                      r"X11Kf6WorkspaceAdjuster\(\)\s*override\s*;",
+                      "X11Kf6WorkspaceAdjuster();",
+                      body,
+                  )
+
+                  # If an older bad patch inserted an inline function body, collapse it back.
+                  body = re.sub(
+                      r"void\s+raiseInputArea\s*\(\s*QWindow\s*\*\s*\w+\s*,\s*const\s+QRect\s*&\s*\w+\s*\)\s*override\s*\{.*?\n\s*\}",
+                      "void raiseInputArea(QWindow *window, const QRect &rect) override;",
+                      body,
+                      flags=re.S,
+                  )
+
+                  # If the Qt6 class still has the old signature, replace it with the base-class signature.
+                  if "raiseInputArea(QWindow *window, const QRect &rect) override" not in body:
+                      body = re.sub(
+                          r"void\s+raiseInputArea\s*\(\s*const\s+QRect\s*&\s*\w+\s*\)\s*;",
+                          "void raiseInputArea(QWindow *window, const QRect &rect) override;",
+                          body,
+                          count=1,
+                      )
+
+                  text = text[:m.start()] + prefix + body + suffix + text[m.end():]
+                  h.write_text(text)
+                  print(f"Patched {h}")
+              else:
+                  print(f"Skip: X11Kf6WorkspaceAdjuster class block not found in {h}")
           else:
-              print(f"Skip: {p} not found")
+              print(f"Skip: {h} not found")
 
           # Patch 2:
+          # In Qt6/KF6 build, do not compile the old X11Kf5WorkspaceAdjuster implementation.
+          # That block refers to KWindowSystem in the KF5 path and breaks Qt6 builds.
+          cpp = Path("src/src/workspaceadjuster/x11workspaceadjuster.cpp")
+          if cpp.exists():
+              text = cpp.read_text()
+
+              qt5_guard = "#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)"
+              start = text.find("X11Kf5WorkspaceAdjuster::")
+              end = text.find("X11Kf6WorkspaceAdjuster::", start if start != -1 else 0)
+
+              if start != -1 and end != -1:
+                  before_start = text[max(0, start - 300):start]
+                  if qt5_guard not in before_start:
+                      text = (
+                          text[:start]
+                          + qt5_guard
+                          + "\n"
+                          + text[start:end]
+                          + "#endif\n\n"
+                          + text[end:]
+                      )
+                      cpp.write_text(text)
+                      print(f"Guarded Qt5-only X11Kf5WorkspaceAdjuster block in {cpp}")
+                  else:
+                      print(f"Skip: Qt5 guard already present in {cpp}")
+              else:
+                  print(f"Skip: could not locate Kf5/Kf6 implementation boundary in {cpp}")
+          else:
+              print(f"Skip: {cpp} not found")
+
+          # Patch 3:
           # Qt's Q_DECLARE_OPERATORS_FOR_FLAGS already declares operator&.
           # Remove the extra handwritten operator& to avoid ambiguous declaration.
           p = Path("src/third-party/ukuiwaylandhelper/ukuiwaylandproperties.h")
@@ -241,7 +296,6 @@ jobs:
                   if end is None:
                       raise RuntimeError(f"Could not find operator& body end in {p}")
 
-                  # Also remove following semicolon if present, though inline function usually has none.
                   cut_end = end + 1
                   if cut_end < len(text) and text[cut_end] == ";":
                       cut_end += 1
@@ -255,8 +309,13 @@ jobs:
               print(f"Skip: {p} not found")
           PY
 
-          echo "Patch preview:"
-          grep -n "X11Kf6WorkspaceAdjuster" -A 12 -B 3 src/src/workspaceadjuster/x11workspaceadjuster.h || true
+          echo "Patch preview: x11workspaceadjuster.h"
+          grep -n "class X11Kf6WorkspaceAdjuster" -A 24 -B 3 src/src/workspaceadjuster/x11workspaceadjuster.h || true
+
+          echo "Patch preview: x11workspaceadjuster.cpp"
+          grep -n "X11Kf5WorkspaceAdjuster\|X11Kf6WorkspaceAdjuster\|QT_VERSION_CHECK" -A 8 -B 8 src/src/workspaceadjuster/x11workspaceadjuster.cpp || true
+
+          echo "Patch preview: ukuiwaylandproperties.h"
           grep -n "Q_DECLARE_OPERATORS_FOR_FLAGS\|operator&" -A 5 -B 5 src/third-party/ukuiwaylandhelper/ukuiwaylandproperties.h || true
 
       - name: Install Debian packaging tools
@@ -297,7 +356,7 @@ jobs:
             * CI rebuild from manually uploaded source archive.
             * Source archive: ${SOURCE_FILE}.
             * Qt6 build for Debian forky arm64.
-            * Apply small Qt6 source compatibility patches during CI.
+            * Apply Qt6/KF6 source compatibility patches during CI.
 
            -- GitHub Actions <actions@github.com>  $(date -R)
           EOF
