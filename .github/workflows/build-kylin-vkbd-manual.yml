@@ -181,80 +181,56 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           # Patch 1:
-          # Fix X11Kf6WorkspaceAdjuster declarations in the header.
+          # Replace x11workspaceadjuster.h with a minimal no-op class declaration.
+          #
+          # Reason:
+          # The upstream support_qt6 source mixes old KF5/X11 declarations with KF6 declarations.
+          # That causes constructor override errors, missing symbols, and missing vtable symbols.
+          #
+          # This build targets Debian/KDE/Wayland on a tablet, so X11 workspace adjustment is not essential.
           h = Path("src/src/workspaceadjuster/x11workspaceadjuster.h")
           if h.exists():
-              text = h.read_text()
+              h.write_text(r'''#pragma once
 
-              m = re.search(
-                  r"(class\s+X11Kf6WorkspaceAdjuster\s*:\s*public\s+WorkspaceAdjuster\s*\{)(.*?)(\n\};)",
-                  text,
-                  flags=re.S,
-              )
+          #include "workspaceadjuster.h"
 
-              if m:
-                  prefix, body, suffix = m.groups()
+          #include <QRect>
+          #include <QWindow>
 
-                  body = re.sub(
-                      r"X11Kf6WorkspaceAdjuster\(\)\s*(?:override\s*)?=\s*default\s*;",
-                      "X11Kf6WorkspaceAdjuster();",
-                      body,
-                  )
+          class X11Kf5WorkspaceAdjuster : public WorkspaceAdjuster {
+          public:
+              X11Kf5WorkspaceAdjuster();
+              ~X11Kf5WorkspaceAdjuster() override = default;
 
-                  body = re.sub(
-                      r"X11Kf6WorkspaceAdjuster\(\)\s*override\s*;",
-                      "X11Kf6WorkspaceAdjuster();",
-                      body,
-                  )
+              void raiseInputArea(QWindow *window, const QRect &rect) override;
+              void fallInputArea() override;
+          };
 
-                  body = re.sub(
-                      r"X11Kf6WorkspaceAdjuster\(\)\s*;",
-                      "X11Kf6WorkspaceAdjuster();",
-                      body,
-                  )
+          class X11Kf6WorkspaceAdjuster : public WorkspaceAdjuster {
+          public:
+              X11Kf6WorkspaceAdjuster();
+              ~X11Kf6WorkspaceAdjuster() override = default;
 
-                  body = re.sub(
-                      r"void\s+raiseInputArea\s*\(\s*QWindow\s*\*\s*\w+\s*,\s*const\s+QRect\s*&\s*\w+\s*\)\s*override\s*\{.*?\n\s*\}",
-                      "void raiseInputArea(QWindow *window, const QRect &rect) override;",
-                      body,
-                      flags=re.S,
-                  )
-
-                  if "raiseInputArea(QWindow *window, const QRect &rect) override" not in body:
-                      body = re.sub(
-                          r"void\s+raiseInputArea\s*\(\s*const\s+QRect\s*&\s*\w+\s*\)\s*;",
-                          "void raiseInputArea(QWindow *window, const QRect &rect) override;",
-                          body,
-                          count=1,
-                      )
-
-                  text = text[:m.start()] + prefix + body + suffix + text[m.end():]
-                  h.write_text(text)
-                  print(f"Patched {h}")
-              else:
-                  print(f"Skip: X11Kf6WorkspaceAdjuster class block not found in {h}")
+              void raiseInputArea(QWindow *window, const QRect &rect) override;
+              void fallInputArea() override;
+          };
+          ''')
+              print(f"Replaced {h} with minimal no-op declaration")
           else:
               print(f"Skip: {h} not found")
 
           # Patch 2:
-          # Replace x11workspaceadjuster.cpp with a minimal Qt6-compatible implementation.
-          #
-          # Reason:
-          # The upstream support_qt6 source mixes old KF5/X11 workspace-adjuster code with KF6 code.
-          # Previous attempts to wrap only part of the file are fragile because the file layout differs
-          # between tags. For this Debian/KDE/Wayland tablet build, making the X11 workspace adjuster
-          # a no-op is acceptable and avoids KWindowSystem/KF5/KF6 symbol breakage.
+          # Replace x11workspaceadjuster.cpp with minimal no-op implementation.
           cpp = Path("src/src/workspaceadjuster/x11workspaceadjuster.cpp")
           if cpp.exists():
               cpp.write_text(r'''#include "x11workspaceadjuster.h"
 
           #include <QRect>
           #include <QWindow>
+          #include <QtGlobal>
 
-          #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
           X11Kf5WorkspaceAdjuster::X11Kf5WorkspaceAdjuster() = default;
 
           void X11Kf5WorkspaceAdjuster::raiseInputArea(QWindow *window, const QRect &rect) {
@@ -264,7 +240,6 @@ jobs:
 
           void X11Kf5WorkspaceAdjuster::fallInputArea() {
           }
-          #endif
 
           X11Kf6WorkspaceAdjuster::X11Kf6WorkspaceAdjuster() = default;
 
@@ -276,7 +251,7 @@ jobs:
           void X11Kf6WorkspaceAdjuster::fallInputArea() {
           }
           ''')
-              print(f"Replaced {cpp} with minimal Qt6-compatible implementation")
+              print(f"Replaced {cpp} with minimal no-op implementation")
           else:
               print(f"Skip: {cpp} not found")
 
@@ -322,10 +297,10 @@ jobs:
           PY
 
           echo "Patch preview: x11workspaceadjuster.h"
-          grep -n "class X11Kf6WorkspaceAdjuster" -A 24 -B 3 src/src/workspaceadjuster/x11workspaceadjuster.h || true
+          sed -n '1,200p' src/src/workspaceadjuster/x11workspaceadjuster.h || true
 
           echo "Patch preview: x11workspaceadjuster.cpp"
-          sed -n '1,160p' src/src/workspaceadjuster/x11workspaceadjuster.cpp || true
+          sed -n '1,200p' src/src/workspaceadjuster/x11workspaceadjuster.cpp || true
 
           echo "Patch preview: ukuiwaylandproperties.h"
           grep -n "Q_DECLARE_OPERATORS_FOR_FLAGS\|operator&" -A 5 -B 5 src/third-party/ukuiwaylandhelper/ukuiwaylandproperties.h || true
@@ -368,8 +343,8 @@ jobs:
             * CI rebuild from manually uploaded source archive.
             * Source archive: ${SOURCE_FILE}.
             * Qt6 build for Debian forky arm64.
-            * Apply Qt6/KF6 source compatibility patches during CI.
             * Replace X11 workspace adjuster with no-op implementation for this Wayland-focused build.
+            * Remove duplicate Qt flag operator overload.
 
            -- GitHub Actions <actions@github.com>  $(date -R)
           EOF
