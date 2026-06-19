@@ -183,45 +183,8 @@ jobs:
           from pathlib import Path
           import re
 
-          def remove_cpp_function(text: str, signature_regex: str) -> str:
-              """
-              Remove one C++ function definition by locating the signature and matching braces.
-              This is intentionally simple but robust enough for ordinary out-of-class definitions.
-              """
-              m = re.search(signature_regex, text)
-              if not m:
-                  return text
-
-              start = m.start()
-              brace = text.find("{", m.end())
-              if brace == -1:
-                  return text
-
-              depth = 0
-              end = None
-              for i in range(brace, len(text)):
-                  if text[i] == "{":
-                      depth += 1
-                  elif text[i] == "}":
-                      depth -= 1
-                      if depth == 0:
-                          end = i + 1
-                          break
-
-              if end is None:
-                  raise RuntimeError("Could not find function body end")
-
-              while end < len(text) and text[end] in " \t\r\n":
-                  end += 1
-
-              return text[:start] + text[end:]
-
           # Patch 1:
-          # Fix X11Kf6WorkspaceAdjuster declarations.
-          # Constructor is made inline default in header.
-          # This avoids both:
-          # - invalid constructor override
-          # - linker undefined reference to X11Kf6WorkspaceAdjuster::X11Kf6WorkspaceAdjuster()
+          # Fix X11Kf6WorkspaceAdjuster declarations in the header.
           h = Path("src/src/workspaceadjuster/x11workspaceadjuster.h")
           if h.exists():
               text = h.read_text()
@@ -237,23 +200,22 @@ jobs:
 
                   body = re.sub(
                       r"X11Kf6WorkspaceAdjuster\(\)\s*(?:override\s*)?=\s*default\s*;",
-                      "X11Kf6WorkspaceAdjuster() = default;",
+                      "X11Kf6WorkspaceAdjuster();",
                       body,
                   )
 
                   body = re.sub(
                       r"X11Kf6WorkspaceAdjuster\(\)\s*override\s*;",
-                      "X11Kf6WorkspaceAdjuster() = default;",
+                      "X11Kf6WorkspaceAdjuster();",
                       body,
                   )
 
                   body = re.sub(
                       r"X11Kf6WorkspaceAdjuster\(\)\s*;",
-                      "X11Kf6WorkspaceAdjuster() = default;",
+                      "X11Kf6WorkspaceAdjuster();",
                       body,
                   )
 
-                  # If an older bad patch inserted an inline raiseInputArea body, collapse it back.
                   body = re.sub(
                       r"void\s+raiseInputArea\s*\(\s*QWindow\s*\*\s*\w+\s*,\s*const\s+QRect\s*&\s*\w+\s*\)\s*override\s*\{.*?\n\s*\}",
                       "void raiseInputArea(QWindow *window, const QRect &rect) override;",
@@ -261,7 +223,6 @@ jobs:
                       flags=re.S,
                   )
 
-                  # If the Qt6 class still has the old signature, replace it with the base-class signature.
                   if "raiseInputArea(QWindow *window, const QRect &rect) override" not in body:
                       body = re.sub(
                           r"void\s+raiseInputArea\s*\(\s*const\s+QRect\s*&\s*\w+\s*\)\s*;",
@@ -279,46 +240,43 @@ jobs:
               print(f"Skip: {h} not found")
 
           # Patch 2:
-          # In Qt6/KF6 build, do not compile old X11Kf5WorkspaceAdjuster implementation.
-          # It refers to old KWindowSystem usage and breaks Qt6 builds.
+          # Replace x11workspaceadjuster.cpp with a minimal Qt6-compatible implementation.
           #
-          # Also remove any out-of-class X11Kf6 constructor definition, because the constructor
-          # is now inline-defaulted in the header.
+          # Reason:
+          # The upstream support_qt6 source mixes old KF5/X11 workspace-adjuster code with KF6 code.
+          # Previous attempts to wrap only part of the file are fragile because the file layout differs
+          # between tags. For this Debian/KDE/Wayland tablet build, making the X11 workspace adjuster
+          # a no-op is acceptable and avoids KWindowSystem/KF5/KF6 symbol breakage.
           cpp = Path("src/src/workspaceadjuster/x11workspaceadjuster.cpp")
           if cpp.exists():
-              text = cpp.read_text()
+              cpp.write_text(r'''#include "x11workspaceadjuster.h"
 
-              # Remove Kf6 constructor definition if present.
-              text2 = remove_cpp_function(
-                  text,
-                  r"X11Kf6WorkspaceAdjuster::X11Kf6WorkspaceAdjuster\s*\(\s*\)\s*"
-              )
-              if text2 != text:
-                  text = text2
-                  print("Removed out-of-class X11Kf6WorkspaceAdjuster constructor definition")
+          #include <QRect>
+          #include <QWindow>
 
-              qt5_guard = "#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)"
-              start = text.find("X11Kf5WorkspaceAdjuster::")
-              end = text.find("X11Kf6WorkspaceAdjuster::", start if start != -1 else 0)
+          #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+          X11Kf5WorkspaceAdjuster::X11Kf5WorkspaceAdjuster() = default;
 
-              if start != -1 and end != -1:
-                  before_start = text[max(0, start - 300):start]
-                  if qt5_guard not in before_start:
-                      text = (
-                          text[:start]
-                          + qt5_guard
-                          + "\n"
-                          + text[start:end]
-                          + "#endif\n\n"
-                          + text[end:]
-                      )
-                      print(f"Guarded Qt5-only X11Kf5WorkspaceAdjuster block in {cpp}")
-                  else:
-                      print(f"Skip: Qt5 guard already present in {cpp}")
-              else:
-                  print(f"Skip: could not locate Kf5/Kf6 implementation boundary in {cpp}")
+          void X11Kf5WorkspaceAdjuster::raiseInputArea(QWindow *window, const QRect &rect) {
+              Q_UNUSED(window)
+              Q_UNUSED(rect)
+          }
 
-              cpp.write_text(text)
+          void X11Kf5WorkspaceAdjuster::fallInputArea() {
+          }
+          #endif
+
+          X11Kf6WorkspaceAdjuster::X11Kf6WorkspaceAdjuster() = default;
+
+          void X11Kf6WorkspaceAdjuster::raiseInputArea(QWindow *window, const QRect &rect) {
+              Q_UNUSED(window)
+              Q_UNUSED(rect)
+          }
+
+          void X11Kf6WorkspaceAdjuster::fallInputArea() {
+          }
+          ''')
+              print(f"Replaced {cpp} with minimal Qt6-compatible implementation")
           else:
               print(f"Skip: {cpp} not found")
 
@@ -367,7 +325,7 @@ jobs:
           grep -n "class X11Kf6WorkspaceAdjuster" -A 24 -B 3 src/src/workspaceadjuster/x11workspaceadjuster.h || true
 
           echo "Patch preview: x11workspaceadjuster.cpp"
-          grep -n "X11Kf5WorkspaceAdjuster\|X11Kf6WorkspaceAdjuster\|QT_VERSION_CHECK" -A 8 -B 8 src/src/workspaceadjuster/x11workspaceadjuster.cpp || true
+          sed -n '1,160p' src/src/workspaceadjuster/x11workspaceadjuster.cpp || true
 
           echo "Patch preview: ukuiwaylandproperties.h"
           grep -n "Q_DECLARE_OPERATORS_FOR_FLAGS\|operator&" -A 5 -B 5 src/third-party/ukuiwaylandhelper/ukuiwaylandproperties.h || true
@@ -411,6 +369,7 @@ jobs:
             * Source archive: ${SOURCE_FILE}.
             * Qt6 build for Debian forky arm64.
             * Apply Qt6/KF6 source compatibility patches during CI.
+            * Replace X11 workspace adjuster with no-op implementation for this Wayland-focused build.
 
            -- GitHub Actions <actions@github.com>  $(date -R)
           EOF
@@ -552,6 +511,10 @@ jobs:
 
           After install, if needed:
             sudo glib-compile-schemas /usr/share/glib-2.0/schemas/
+
+          Note:
+            This build replaces the X11 workspace adjuster with a no-op implementation.
+            It is intended for the Debian/KDE/Wayland tablet use case.
           EOF
 
           echo "Artifacts:"
