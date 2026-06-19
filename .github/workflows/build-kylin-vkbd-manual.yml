@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       source_archive_path:
-        description: "Source archive path from repository root, for example vendor/kylin-virtual-keyboard/support_qt6.zip"
+        description: "Repo-relative source archive path. Supported: .zip .tar.gz .tgz .tar.xz .txz .tar.zst. Put version in filename like kylin-virtual-keyboard-4.24.0.0-support_qt6.zip; first dotted number becomes deb version. No version => 0.0~manual<UTC>."
         required: true
-        default: "vendor/kylin-virtual-keyboard/support_qt6.zip"
+        default: "vendor/kylin-virtual-keyboard/kylin-virtual-keyboard-4.24.0.0-support_qt6.zip"
 
 permissions:
   contents: read
@@ -42,7 +42,8 @@ jobs:
             findutils \
             coreutils \
             sed \
-            grep
+            grep \
+            python3
 
       - name: Checkout this repository
         uses: actions/checkout@v4
@@ -63,7 +64,8 @@ jobs:
 
           if [ ! -f "$ARCHIVE" ]; then
             echo "Source archive not found: $ARCHIVE" >&2
-            echo "Existing archive-like files:" >&2
+            echo "" >&2
+            echo "Existing supported archive files:" >&2
             find . -type f \( \
               -name '*.zip' -o \
               -name '*.tar.gz' -o \
@@ -79,12 +81,12 @@ jobs:
           BASE="$FILENAME"
 
           case "$BASE" in
-            *.tar.gz) BASE="${BASE%.tar.gz}" ;;
-            *.tgz)    BASE="${BASE%.tgz}" ;;
-            *.tar.xz) BASE="${BASE%.tar.xz}" ;;
-            *.txz)    BASE="${BASE%.txz}" ;;
+            *.tar.gz)  BASE="${BASE%.tar.gz}" ;;
+            *.tgz)     BASE="${BASE%.tgz}" ;;
+            *.tar.xz)  BASE="${BASE%.tar.xz}" ;;
+            *.txz)     BASE="${BASE%.txz}" ;;
             *.tar.zst) BASE="${BASE%.tar.zst}" ;;
-            *.zip)    BASE="${BASE%.zip}" ;;
+            *.zip)     BASE="${BASE%.zip}" ;;
             *)
               echo "Unsupported archive format: $FILENAME" >&2
               echo "Supported: .zip .tar.gz .tgz .tar.xz .txz .tar.zst" >&2
@@ -173,6 +175,90 @@ jobs:
           echo "Source root:"
           ls -la src
 
+      - name: Patch Qt6 source compatibility issues
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          # Patch 1:
+          # Fix X11Kf6WorkspaceAdjuster:
+          # - constructor cannot be marked override
+          # - class must implement WorkspaceAdjuster::raiseInputArea(QWindow*, const QRect&)
+          p = Path("src/src/workspaceadjuster/x11workspaceadjuster.h")
+          if p.exists():
+              text = p.read_text()
+
+              text = text.replace(
+                  "X11Kf6WorkspaceAdjuster() override = default;",
+                  "X11Kf6WorkspaceAdjuster() = default;"
+              )
+
+              if (
+                  "void raiseInputArea(QWindow *window, const QRect &rect) override" not in text
+                  and "void raiseInputArea(const QRect &rect);" in text
+              ):
+                  text = text.replace(
+                      "void raiseInputArea(const QRect &rect);",
+                      """void raiseInputArea(QWindow *window, const QRect &rect) override {
+                  (void)window;
+                  raiseInputArea(rect);
+              }
+              void raiseInputArea(const QRect &rect);"""
+                  )
+
+              p.write_text(text)
+              print(f"Patched {p}")
+          else:
+              print(f"Skip: {p} not found")
+
+          # Patch 2:
+          # Qt's Q_DECLARE_OPERATORS_FOR_FLAGS already declares operator&.
+          # Remove the extra handwritten operator& to avoid ambiguous declaration.
+          p = Path("src/third-party/ukuiwaylandhelper/ukuiwaylandproperties.h")
+          if p.exists():
+              text = p.read_text()
+              sig = "inline UkuiWindowState operator&(UkuiWindowState lhs, UkuiWindowState rhs)"
+              idx = text.find(sig)
+
+              if idx != -1:
+                  brace = text.find("{", idx)
+                  if brace == -1:
+                      raise RuntimeError(f"Found operator& signature but no opening brace in {p}")
+
+                  depth = 0
+                  end = None
+                  for i in range(brace, len(text)):
+                      if text[i] == "{":
+                          depth += 1
+                      elif text[i] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              end = i
+                              break
+
+                  if end is None:
+                      raise RuntimeError(f"Could not find operator& body end in {p}")
+
+                  # Also remove following semicolon if present, though inline function usually has none.
+                  cut_end = end + 1
+                  if cut_end < len(text) and text[cut_end] == ";":
+                      cut_end += 1
+
+                  text = text[:idx] + text[cut_end:]
+                  p.write_text(text)
+                  print(f"Patched {p}")
+              else:
+                  print(f"Skip: extra operator& not found in {p}")
+          else:
+              print(f"Skip: {p} not found")
+          PY
+
+          echo "Patch preview:"
+          grep -n "X11Kf6WorkspaceAdjuster" -A 12 -B 3 src/src/workspaceadjuster/x11workspaceadjuster.h || true
+          grep -n "Q_DECLARE_OPERATORS_FOR_FLAGS\|operator&" -A 5 -B 5 src/third-party/ukuiwaylandhelper/ukuiwaylandproperties.h || true
+
       - name: Install Debian packaging tools
         run: |
           set -eux
@@ -211,6 +297,7 @@ jobs:
             * CI rebuild from manually uploaded source archive.
             * Source archive: ${SOURCE_FILE}.
             * Qt6 build for Debian forky arm64.
+            * Apply small Qt6 source compatibility patches during CI.
 
            -- GitHub Actions <actions@github.com>  $(date -R)
           EOF
@@ -344,9 +431,14 @@ jobs:
           cat > out/README.txt <<EOF
           Source archive: ${{ steps.archive.outputs.filename }}
           Package version: ${{ steps.archive.outputs.deb_version }}
+          Artifact name: ${{ steps.archive.outputs.artifact_name }}
           Target: Debian forky arm64 Qt6
+
           Install command:
             sudo apt install ./kylin-virtual-keyboard_*_arm64.deb
+
+          After install, if needed:
+            sudo glib-compile-schemas /usr/share/glib-2.0/schemas/
           EOF
 
           echo "Artifacts:"
